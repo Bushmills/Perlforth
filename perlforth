@@ -1,0 +1,1962 @@
+#!/usr/bin/perl
+# -------- description + version history                      -------- #FOLD00
+
+=head1 PerlForth
+   an incremental compiler and interactive interpreter, based on a
+   virtual machine, executing indirect threaded code.
+
+=cut
+
+my $version = 27;
+# to do: improved file interface. can only read source files to compile from now.
+# time of last change:
+
+# 20110512,ls    colors
+# 20110428,ls 0.27 arithmetic on addresses may result in negative mem array indici. changed some memory primitives to unsign addresses 
+# 20110427,ls problem with 64 bit. forcing to 32 bit for now.
+# 20110420,ls 0.26 string packing and unpacking using W type strings.
+# 20091001,ls 0.25 initialising catchframe in empty avoids undefined error handler when quitting in site-forth.4th
+# 20090930,ls 0.24 loading /usr/local/share/perlforth/site-forth.4th at start
+# 20090106,ls 0.23 fixes for 64bit Perl versions
+# 20090106,ls 0.22 can compile source from included file.
+# 20090103,ls 0.21 vocabularies.
+# 20090101,ls 0.20 prepared for vocabularies.
+# 20081228,ls 0.19 radix prefixes
+# 20081228,ls 0.18 catch, throw, top level error handler, fixed bug in hash which rendered does> defective
+# 20081228,ls 0.17 experimentally connected Perl exception handler to interpreter errors
+# 20081223,ls 0.16 does>, keymap lister, linked vars, defers, constants, arrays.
+# 20081223,ls 0.15 hilevelized/deperled many words. key is now deferred. cleanup. stuff added.
+# 20081221,ls 0.14 simulated disk loaded during boot, extending interpreter.
+#                  better compile-time word defining macros.
+#                  branching version which moves definitions to simulated disk.
+# 20081221,ls 0.13 simulated disk for testing compiling from file.
+# 20081221,ls 0.12 some string support:  ."   s"  ,"  /string   move$
+# 20081220,ls 0.11 added move fill for next leave ?leave i j do ?do loop
+# 20081217,ls 0.10 numbers, if else then begin while repeat until again.
+# 20081217,ls 0.09 added  [ ], create, variable, : ; colon definitions work.
+# 20081217,ls 0.08 input line is parsed now. "real" interpreter connected,
+#                  but compilation and numbers are stubs.
+# 20081217,ls 0.07 bit logic, comparison, keymap customizer, hide/reveal, skip/scan
+# 20081215,ls 0.06 debugging and cleanup
+# 20081215,ls 0.05 rudimentary command execution loop
+# 20081214,ls 0.04 rudimentary buffered line input, more primitives.
+# 20081213,ls 0.03 more run time words, primitives, flow control
+# 20081211,ls 0.02 added run time words, constants, minimal flow control
+# 20081210,ls 0.01 ITC inner interpreter executes lo- and hilevel
+
+
+use strict;
+use warnings;
+
+use Term::ReadKey;
+#use Term::ANSIColor;
+
+# -------- configuration items                                -------- #FOLD00
+
+my $tibsize  = 256;                                        # size of terminal input buffer
+my $cell;
+
+# override. uses perl compilation width if undefined.
+#   $cell     = 0;                                          # bits per cell determined by size perl has been compiled for
+#    $cell   = 0xffff;                                     # 16 bit override
+    $cell   = 0xffffffff;                                 # 32 bit override
+#    $cell   = 0xffffffffffffffff;                         # 64 bit override
+# 2011apr27,ls  problem with 64 bit. forcing to 32 bit for now.
+
+
+# -------- simulated sources disk                             -------- #FOLD00
+
+
+# simulated source disk, contents are loaded and compiled during boot
+my @disk =
+    (
+"forth only",
+"forth definitions",
+     '#10 base !',
+
+     ': binary      2 base ! ;',                           # ( -- )
+     ': octal       8 base ! ;',                           # ( -- )
+     ': decimal    10 base ! ;',                           # ( -- )
+     ': hex        16 base ! ;',                           # ( -- )
+
+
+     ": align     ; immediate",                            # ( -- )
+     ": aligned   ; immediate",                            # ( a1 -- a2 )
+     ": pad       here 256 + ;",                           # ( -- a )
+
+     ": latest    last @     ;",                           # ( -- a )
+     ": recurse   latest ,   ; immediate",                 # ( -- )
+"also hidden",
+     ": compile   r> skim , >r ;",                         # ( -- )
+     ": postpone  ' , ;  immediate",                       # ( -- )
+     ": literal   ?comp (lit) (lit) , ,  ; immediate",     # ( x -- )  ( -- x )
+     ": [']       ' postpone literal     ; immediate",     # ( -- )  ( -- a )
+"previous",
+     # --- chars and strings ---
+     ': char      bl parse drop c@ ;',                     # ( -- c )
+     ': [char]    char postpone literal  ; immediate',     # ( -- )  ( -- c )
+     ': ctrl      char $1F and ;',                         # ( -- c )
+     ': [ctrl]    ctrl postpone literal  ; immediate',     # ( -- )  ( -- c )
+
+     ': \         0 parse 2drop ;          immediate',     # ( -- )
+     ': //        postpone \ ;             immediate',     # ( -- )
+
+     ': s(        [char] ) parse ;',                       # ( -- a n )
+     ': (         s( 2drop               ; immediate',     # ( -- )
+     ': .(        s(  type ;',                             # ( -- )
+"also hidden",
+     ': move$     2dup c! 1+ swap move ;',                 # ( a1 n a2 -- )
+     ': ,s        here over 1+ allot move$ ;',             # ( a n -- )
+     ': ,"        [char] " parse ,s ;',                    # ( -- )
+     ': s"        ?comp [\'] (slit) , ," ; immediate',     # ( -- )  ( -- a n )
+     ': ."        ?comp [\'] (.")   , ," ; immediate',     # ( -- )  ( -- )
+
+
+     # --- flow control ---
+"definitions",
+     ': resolve   here - , ;',                             # ( a -- )
+     ': <resolve  here over - swap ! ;',                   # ( a -- )
+     ": ?clause   compile (0branch) ;",                    # ( -- )
+     ": clause    compile (branch)  ;",                    # ( -- )
+     ": mark      here 0 , ;",                             # ( -- a )
+"previous definitions",
+
+"also hidden",
+     ': if        ?comp ?clause mark 1 ; immediate',
+     ': else      ?comp 1 structured clause mark swap <resolve 2 ; immediate',
+     ': then      ?comp dup 2 = + 1 structured <resolve ; immediate',
+     ': endif     postpone then ; immediate',
+     ': begin     ?comp here 3 ; immediate',
+     ': while     ?comp 3 structured ?clause mark 4 ; immediate',
+     ': repeat    ?comp 4 structured swap clause resolve <resolve ; immediate',
+     ': until     ?comp 3 structured ?clause resolve ; immediate',
+     ': again     ?comp 3 structured  clause resolve ; immediate',
+"definitions",
+     ": docompiler  create , , immediate",
+     "              does> ?comp skim , @ >r",
+     "              here innerloop exchange",
+     "              mark r> ;",
+     ": loopcompiler create , , immediate",
+     "   does> ?comp skim >r @ structured r> , dup 1+ resolve <resolve innerloop ! ;",
+"previous definitions",
+
+"also hidden",
+     "5 ' (do)     docompiler do",
+     "5 ' (?do)    docompiler ?do",
+     "6 ' (for)    docompiler for",
+     "5 ' (loop)   loopcompiler loop",
+     "5 ' (+loop)  loopcompiler +loop",
+     "6 ' (next)   loopcompiler next",
+
+     ": leave,     ?comp innerloop @ ?dup 0= -26 and throw swap , , ;",
+     ": leave      ['] (leave) leave, ; immediate",
+     ": ?leave     ['] (?leave) leave, ; immediate",
+     ": unloop     ?comp innerloop @ 0= -26 and throw compile (unloop) ; immediate",
+
+     # ---
+     ': tuck       swap over ;',                           # ( x1 x2 -- x2 x1 x2 )
+     ': pluck      2 pick ;',                              # ( x1 x2 x3 -- x1 x2 x3 x1 )
+     ': max        2dup < if swap then drop ;',            # ( x1 x2 -- x1|x2 )
+     ': min        2dup > if swap then drop ;',            # ( x1 x2 -- x1|x2 )
+     ': -rot       rot rot ;',                             # ( x1 x2 x3 -- x3 x1 x2 )
+
+     ': (abort")   if -2 dup r> count newerror throw then',
+     '             r> count + >r ;',
+     ': abort"     ?comp  compile (abort") ," ; immediate',      # ( f -- )
+
+     ': link       here swap exchange , ;',
+     ': unlink     dup @ ?dup if @ over ! then drop ;',
+
+     # tricky: 'make new constants behave like "true" (which is a constant)'
+     # tricky: 'make new deferred words behave like "key" (which is a deferred word)'
+     # tricky: 'make new arrays behave like "keytable" (which is an array)'
+     # tricky: 'make new vocabularies behave like "forth" (which is a vocabulary)'
+     ": constant   constants link  create ,  [ ' true @ ] literal use ;",
+     '1 constant   cell',
+     ": defer      defers link  create cell allot  [ ' key @ ] literal use ;",
+     ": array      arrays link  create dup , allot  [ ' keytable @ ] literal use ;",
+     ": vocabulary vocabularies link  create 0 , 0 , [ ' forth @ ] literal use ;",
+     ': variable   variables link  create cell allot ;',
+     ": value      constant ;",    # values behave like constants. for now.
+     ': vocs       vocabularies begin @ ?dup while dup 1+ .name space repeat ;',
+'previous',
+
+     ': cell+ 1+ ;    : char+ 1+ ;',
+     ': cell- 1- ;    : char- 1- ;',
+     ': cells ;       : chars ; ',
+
+     ': range      over + swap ;',                         # ( x1 n -- x2 x1 )
+     ': erase      0 fill ;',                              # ( a n -- )
+     ': blank      bl fill ;',                             # ( a n -- )
+     ': c,         255 and , ;',                           # ( c -- )
+
+     ': within     pluck < >r < r> or 0= ;',               # ( n1 n2 n3 -- f )
+     ': printable  bl 127 within ;',                       # ( c -- f )
+
+     ': emits      swap dup 0> and',                       # ( u c -- )
+     '             0 ?do dup emit loop drop ;',
+     ': spaces     bl emits ;',                            # ( u -- )
+
+     ': >body      cell+ ; ',                              # ( a1 -- a2 )
+     ': body>      cell- ; ',                              # ( a1 -- a2 )
+
+     ': word      here >r parse r@ move$ r> ;',            # ( c -- a )
+
+     ': lines      >r',                                    # ( a -- )
+     '             bl word count',
+     '             fileopen',
+     '             begin fileread',
+     '             while r@ execute',
+     '             repeat',
+     '             fileclose rdrop ;',
+
+     ": from       fileopen",                              # ( a n -- )
+     "             begin fileread",
+     "             while evaluate",
+     "             repeat fileclose ;",
+
+     ': from"      [char] " parse from ;',                 # ( -- )
+
+     # is and to identical yet but they will check to make sure the target is of proper type
+     # therefore no factoring in these words, as these are in transition.
+"also hidden definitions",
+     ": (was)     r> dup cell+ >r @ >body @ ;",
+     ": (is)      r> dup cell+ >r @ >body ! ;",
+     ": (to)      r> dup cell+ >r @ >body ! ;",
+"previous definitions",
+
+"also hidden",
+     ": was       compiling if compile (was) exit then ' >body @ ; immediate",
+     ": is        compiling if compile (is)  exit then ' >body ! ; immediate",
+     ": to        compiling if compile (to)  exit then ' >body ! ; immediate",
+"previous",
+
+     # --- obsolescent input parsing and vocabulary search. required by dpans94 ---
+
+     ': find      dup count hunt',                         # ( a1 -- a2 0 | a2 1 | a2 -1 )
+     '            dup if',                                 # 1: immediate.  -1: non-immediate
+     '               nip dup name>',
+     '               swap ?imm invert 1 or',
+     '            then ;',
+
+     # --- pictured number output conversion ---
+     ': s>d     dup 0< ;',                                 # ( x -- d )
+     ': <#      swap >r  pad tuck r> ;',                   # ( d -- a x a x )
+
+     ': #>      drop nip tuck - ;',                        # ( a x a x -- a x )
+     ': hold    rot 1-',                                   # ( a x c -- a x )
+     '          dup here < -17 and throw',
+     '          -rot pluck c! ;',
+     ': cipher  dup 9 > if 7 + then [char] 0 +  ;',        # ( n -- c )
+     ': #       base @ u/mod swap cipher hold ;',          # ( a x -- a x )
+     ': #s      begin # dup 0= until ;',                   # ( a x -- a x )
+     ': sign    pluck 0< if [char] - hold then ;',         # ( x a x -- x a x )
+     ': string  <# #s sign #> ;',                          # ( n -- a n )
+     ': (.)     s>d >r abs r> string ;',                   # ( n1 -- a n2 )
+     ': (u.)    0 string ;',                               # ( u -- a n )
+     ': .       (.) type space ;',                         # ( n -- )
+     ': u.      (u.) type space ;',                        # ( u -- )
+     ': (.r)    over - spaces type ;',                     # ( a n1 n2 -- )
+     ': .r      >r (.)  r> (.r) ;',                        # ( n u -- )
+     ': u.r     >r (u.) r> (.r) ;',                        # ( u1 u2 -- )
+
+     ': .b      base exchange swap u. base ! ;',           # ( n base -- )
+     ': .%       2 .b ;',                                  # ( n -- )
+     ': .#      10 .b ;',                                  # ( n -- )
+     ': .$      16 .b ;',                                  # ( n -- )
+     ': .s      depth ?dup if',                            # ( -- )
+     '             for i pick . next',
+     '          else ." stack empty"',
+     '          then ;',
+     ': number  ?number 0= -24 and throw ;',               # ( a n1 -- n2 )
+
+     # --- string words
+     ': /string   over min tuck 2>r + 2r> - ;',            # ( a n1 n2 -- )
+     ': -trailing dup if dup for 1- 2dup + c@ bl <> ?leave next 1+ then ;',
+     # left/right boundary, centered type
+     ': typer ( a n1 n2 -- ) over - 0 max            spaces      type ;',
+     ': typel ( a n1 n2 -- ) over - 0 max                     >r type r> spaces ;',
+     ': typec ( a n1 n2 -- ) over - 0 max dup 2/ dup spaces - >r type r> spaces ;',
+
+     # --- 'char, ^ctrlchar, >shellcommand input
+"also hidden definitions",
+     ': toshell  1 /string drop 0 parse + over -',   # ( a n -- )
+     '  compiling if compile (slit) ,s compile then shell ;',
+     ": andchar  nip swap 1+ c@ and compiling if postpone literal then ;",  # ( a n -- c )
+     ": tochar   255 andchar ;",     # ( a n -- c )
+     ": toctrl    31 andchar ;",  # ( a n -- c )
+     ': dispatchable            s" \'^>" rot scan nip ;',   # ( c -- u )
+     "     create action  ] toshell toctrl tochar [",
+     ': dispatch action + @ execute ;',            # ( a n1 n2 -- ? )
+     ": prefixes over c@ dispatchable ?dup if 1- dispatch exit then",
+     #"             2dup analyze_input if process_input exit then",
+     "          (notfound) ;",
+     "' prefixes is notfound",                          # ( a n -- ? )
+
+     ': .?   dup defined if . else drop ." undefined" then ;',
+     ': .linknames',
+     '           >r  begin @ ?dup',
+     '           while dup 1+',
+     '              dup cr .name ." : "',
+     '              >body @ r@ execute',
+     '           repeat rdrop cr ;',
+
+     ": .variables variables ['] .?    .linknames ;",
+     ": .constants constants ['] .     .linknames ;",
+     ": .arrays    arrays    ['] .     .linknames ;",
+     ": .defers    defers    ['] .name .linknames ;",
+     ": .vocs   vocabularies ['] .     .linknames ;",
+     ": user_interrupt -28 throw ;",
+"previous definitions",
+
+     ': shell: create ," does> count shell ;',
+     'shell: page    clear',
+     'shell: ps      ps auxf|pager',
+     'shell: sh      bash',
+
+     ': command: create does> drop source shell postpone \ ;',
+     'command: ls',
+     ': cls  page ;',
+     ': commandline  ." (ctrl-D to exit)" sh ."   ok" cr ;',
+     ': .keys  -1 keytable @ 0 do',
+     '            i keytable @',
+     '            ?dup if',
+     "               dup ['] nop <> if",
+     '                  cr ." ctrl-" i \'@ + emit',
+     '                  3 spaces dup .name',
+     '               then',
+     '               drop',
+     '            then',
+     '         loop cr ;',
+
+     #     "0 keytable  -1 keytable @  ' nop fill",
+     "0 keytable  bl ' nop fill",
+     ": bindkey         keytable ! ;",
+
+"also hidden",
+     "' .arrays         ^A bindkey",
+     "' .constants      ^B bindkey",
+     "' user_interrupt  ^C bindkey",
+     "' commandline     ^D bindkey",
+     "' .defers         ^E bindkey",
+     "    0             ^H bindkey",
+     "    0             ^I bindkey",
+     "    0             ^J bindkey",
+     "' .keys           ^K bindkey",
+     "' page            ^L bindkey",
+     "' order           ^O bindkey",
+     "' bye             ^Q bindkey",
+     "' .variables      ^V bindkey",
+     "' words           ^W bindkey",
+     "' .vocs           ^X bindkey",
+
+     ': fkey',
+     '    begin (key)',
+     '        dup bl < 0= unless',
+     '        dup keytable @',
+     '    ?dup while',
+     '        execute drop',
+     '    repeat ;',
+
+     ': accept   >r 0',                                    # ( a n1 -- n2 )
+     '    begin dup r@ <>',
+     '    while fkey dup 10 =',
+     '        if r> 2drop dup >r',
+     '        else  decode',
+     '        then',
+     '    repeat swap r> 2drop ;',
+
+     ': query    tib dup tibsize accept dup #tib ! pushsource space ;',
+"definitions",
+     ": (quit)   empty postpone [ begin query interpret prompt again ;",
+     "' (quit) is quit",
+     ': (prompt) compiling 0= if ."  ok"  depth 0 ?do \'. emit loop then cr ;',
+     "' (prompt) is prompt",
+"previous definitions",
+
+     ": :noname ?exec here [ latest @ ] literal , ] ; immediate",
+
+     # -- time
+     ": time     ( -- secs )   epoch 86400 mod ;",
+     ": ##:      ( u1 -- u2 )  base @ >r decimal # 6 base ! # ': hold r> base ! ;",
+     ": .now     ( -- )        time  s>d <# ##: ##: #s #> type ;",
+     ": now      ( -- s m h )  time   60 /mod  60 /mod ;",
+
+     # load site-forth.4th  at start
+     ' :noname ( -- )  s" /usr/local/share/perlforth/site-forth.4th" from ; catch drop',
+#     ' \  dup -38 <> and throw',
+
+     '.( Threaded Code Interpreter in Perl, version )',
+     "           version  s>d <# # # '. hold #s #> type",
+     "           '. emit here . cr space",
+
+
+    );
+
+
+# -------- virtual machine data                               --------
+# VM memory
+my @m;                                                     # main memory
+my @s;                                                     # user stack
+my @r;                                                     # return stack
+
+# global VM registers
+my $sp;                                                    # user stack pointer
+my $rp;                                                    # return stack pointer
+my $w;                                                     # word pointer
+my $ip;                                                    # instruction pointer
+
+# global interpreter/compiler variables
+my $dp = 0;                                                # pointer to free VM mem
+my $wc = 0;                                                # word count, analog the name field address
+my @header;                                                # word headers
+my @body;                                                  # pointers to word code fields
+my @voclink;                                               # pointer to index of next word of same vocabulary
+my @precedence;                                            # reveal/precedence flags per word
+
+my $parsebuf;                                              # pointer to current source buffer
+my $parsebuflen;                                           # size of current source buffer
+my @sourcestack;                                           # holds nested source buffer
+my %does;                                                  # helper hash for create .. does> simplification
+my $catchframe = 0;                                        # pointer to prev catch/throw context (or 0)
+
+
+
+my $maxu = (-1|0);                                         # determine cell size in bits
+   $maxu = $cell if ($cell);                               # or use override
+my $wrap = $maxu+1;                                        # modulo for trimming results to fit into cell
+my $msb  = 1;                                              # value with only the most significant bit set
+my $bits = 1;
+for (;$msb<$wrap/2;$msb+=$msb) {$bits++}
+#print "$msb, $bits";
+
+my $revealbit     = 1;
+my $precedencebit = 2;
+
+# variables residing in interpreter virtual memory space.
+
+sub comma {
+    $m[$dp] = shift(@_);
+    return $dp++;
+}
+
+
+my @vocstack;
+my $xlaststore    = comma 0;
+my $xcurrentstore = comma 0;
+my $xcontextstore = comma 0;
+
+
+# -------- virtual machine                                    --------
+
+#$meow = $model ? sub { 'purr' } : sub { q/=^_^=/ };  $meow->();
+
+sub nest   { $r[++$rp] = $ip; $ip = $w+1; }
+sub unnest { $ip = $r[$rp--]; }
+my $unnest = $dp;
+$m[$dp++]  = \&unnest;
+
+sub doconst { $s[++$sp] = $m[$w+1]; }
+sub dovar   { $s[++$sp] = $w+1; }
+sub dodefer { $w = $m[$w+1]; $m[$w](); }
+sub dovoc   { $m[$xcontextstore] = $w; }
+
+
+# -------- vocabularies                                       --------
+
+sub reveal    { $precedence[$wc-1] |= $revealbit; }
+sub immediate { $precedence[$wc-1] |= $precedencebit; }
+sub hide      { $precedence[$wc-1] &= ~$revealbit; }
+
+sub header {
+    $header[$wc] = shift(@_);
+    $body[$wc]   = $dp;
+    $precedence[$wc] = 0;
+    $voclink[$wc] = $m[$m[$xcurrentstore]+2];
+    $m[$xlaststore] = $dp;
+    $m[$m[$xcurrentstore]+1] = $dp;
+    $m[$m[$xcurrentstore]+2] = $wc;
+    $wc++;
+    return $dp;
+}
+
+
+sub xlink {
+    my $anchor   = (shift(@_))+1;
+    ($m[$anchor], $m[$dp]) = ($dp, $m[$anchor]);
+    $dp++;
+}
+
+sub allot { $dp += shift(@_); }
+
+my $xvocabularies = comma \&dovar; comma 0;      # a hand-built variable, needed early.(for linking
+                                                 # vocabularies needed to contain the link anchors
+                                                 # of variables, constant, vocabularies...)
+sub vocabulary {
+    xlink $xvocabularies;
+    my $addr = comma \&dovoc; comma 0; comma 0;  # last cfa, last wc.
+    return $addr;
+}
+
+my $xonlyvoc = vocabulary; sub only   { $m[$xcontextstore] = $xonlyvoc; }
+my $xforth   = vocabulary; sub forth  { $m[$xcontextstore] = $xforth; }
+my $xhidden  = vocabulary; sub hidden { $m[$xcontextstore] = $xhidden; }
+
+sub definitions { $m[$xcurrentstore] = $m[$xcontextstore] }
+
+hidden; definitions;
+header "";                                                 # must be header 0 (0 represents end
+                                                           # of chain, common for all vocabularies)
+
+# to do:
+# hand-craft a link anchor, used as link anchor for list of link anchors here.
+# link "vocabularies" link anchor to this link anchor. later, create a header,
+# link "anchors" to itself. moala - mother of all link anchors.
+
+header "vocabularies"; reveal;                             # header for vocabularies link anchor.
+$body[$wc-1] = $xvocabularies;
+
+only; definitions;
+header "forth"; reveal;
+$body[$wc-1] = $xforth;
+
+forth; definitions;
+header "only"; reveal;
+$body[$wc-1] = $xonlyvoc;
+
+header "hidden"; reveal;
+$body[$wc-1] = $xhidden;
+
+
+# -------- macros: defining words                             -------- #FOLD00
+
+
+sub compile {
+    my $addr = $dp;
+    foreach my $i (0..$#_) {
+        comma $_[$i];
+    }
+    return $addr;
+}
+
+sub colon     {
+    header shift(@_);
+    return compile \&nest;
+}
+
+sub semicolon {
+    compile $unnest;
+    reveal;
+}
+
+sub unnamedprimitive {
+    return compile shift(@_);
+}
+
+sub primitive {
+    header shift(@_);
+    reveal;
+    return compile shift(@_);
+}
+
+sub create {
+    header shift(@_);
+    reveal;
+    return compile \&dovar;
+}
+
+sub xnop { }
+my $xnop = primitive "nop", \&xnop;
+
+
+hidden; definitions;
+my $xconstants = create "constants"; comma 0;
+sub constant {
+    xlink $xconstants;
+    header shift(@_);
+    reveal;
+    return compile \&doconst, shift(@_);
+}
+
+my $xvariables = create "variables"; comma 0;
+sub variable {
+    xlink $xvariables;
+    header shift(@_);
+    reveal;
+    return compile \&dovar, shift(@_);
+}
+
+sub alias {
+    my $cfa = $body[$wc-1];
+    header shift(@_);
+    reveal;
+    $body[$wc-1] = $cfa;
+    return $cfa;
+}
+
+
+my $xdefers = create "defers"; comma 0;
+sub defer {
+    xlink $xdefers;
+    header shift(@_);
+    reveal;
+    return compile \&dodefer, shift(@_);
+}
+
+# ( a n -- )  packs chars at $m[$a..$a+n-1] into string which is returned.
+sub string {
+    my $x2 = $s[$sp--]&$cell;
+    my $x1 = $s[$sp--]&$cell;
+    return pack "W*",@m[$x1..$x1+$x2-1];
+}
+
+# ( a -- n )  unpacks chars of string par to $m[$a..]
+sub unstring {
+    my @arg = unpack "W*", $_[0];
+    $w = @arg;
+    (my $addr, $s[$sp]) = ($s[$sp], $w);
+    @m[$addr..$addr+$w-1] = @arg;
+}
+
+# -------- vocabularies search order                          -------- #FOLD00
+
+only; definitions;
+sub xalso { push @vocstack, $m[$xcontextstore]; }
+primitive "also", \&xalso;
+
+forth; definitions;
+my $xlast = constant  "last", $xlaststore;
+
+constant "context", $xcontextstore;
+constant "current", $xcurrentstore;
+
+sub xprevious {
+    $m[$xcontextstore] = pop @vocstack if ($#vocstack >= 0);
+}
+primitive "previous", \&xprevious;
+
+sub xonly {
+    $m[$xcontextstore] = $xonlyvoc;
+    @vocstack = $xonlyvoc;
+}
+my $xonly = primitive "only", \&xonly;
+
+sub xdefinitions { $m[$xcurrentstore] = $m[$xcontextstore]; }
+primitive "definitions", \&xdefinitions;
+
+# -------- error handling                                     -------- #FOLD00
+
+
+my %throwmessage = (
+  -1  => "aborted",
+  -2  => "aborted",
+  -3  => "stack overflow",
+  -4  => "stack underflow",
+  -5  => "return stack overflow",
+  -6  => "return stack underflow",
+#  -7  => "do loops nested too deeply",
+#  -8  => "dictionary overflow",
+  -9  => "invalid memory address",
+  -10 => "division by zero",
+  -11 => "result out of range",
+  -12 => "argument type mismatch",
+  -13 => "word not found",
+  -14 => "use only during compilation",
+  -15 => "invalid forget",
+  -16 => "attempt to use zero-length string as name",
+  -17 => "pictured numeric output string overflow",
+  -18 => "parsed string overflow",
+#  -19 => "word name too long",
+  -20 => "write to a read-only location",
+  -21 => "unsupported operation",
+  -22 => "unstructured",
+#  -23 => "address alignment exception",
+  -24 => "invalid numeric argument",
+  -25 => "return stack imbalance",
+  -26 => "loop parameters unavailable",
+  -27 => "invalid recursion",
+  -28 => "user interrupt",
+  -29 => "compiler nesting",
+  -30 => "obsolescent feature",
+  -31 => ">BODY used on non-CREATEd definition",
+  -32 => "invalid name argument",
+  -33 => "Block read exception",
+  -34 => "Block write exception",
+  -35 => "Invalid block number",
+  -36 => "Invalid file position",
+  -37 => "File I/O exception",
+  -38 => "File not found",
+
+# additional error messages:
+  -64 => "use only while interpreting",
+  -65 => "executed BODY> on a non-body address",
+  -67 => "TO must be used on a VALUE",
+  -72 => "Invalid memory region specifier, or heap corrupted",
+);
+
+# used by abort"  to introduce new abort messages
+sub xnewerror {                                            # ( n1 a n2 -- )
+    $throwmessage{$s[$sp--]} = string;
+}
+primitive "newerror", \&xnewerror;
+
+
+# executed at the end of word executed by catch.
+sub xbrthrow0  {
+    ($ip, $sp, $catchframe) = @r[$rp-2..$rp];              # restore previous catch context
+    $rp -= 3;
+    $s[$sp] = 0;                                           # throw value 0
+}
+my $xbrthrow0 = compile unnamedprimitive \&xbrthrow0;      # not a primitive - returning to.
+
+sub xexecute { $w = $s[$sp--]; $m[$w](); }
+my $xexecute = primitive "execute", \&xexecute;
+
+
+# ( a -- x )
+sub xcatch {
+    $rp += 3;                                              # room for new catch frame
+    @r[$rp-2..$rp] = ($ip, $sp, $catchframe);              # save previous catch context
+    $catchframe = $rp;                                     # point to this catch frame
+    $r[++$rp] = $xbrthrow0;                                # inject return address to throw0
+    xexecute;                                              # call word running under catch
+}
+my $xcatch = primitive "catch", \&xcatch;
+
+
+# ( err -- )
+sub throw {
+    my $exception = shift;                                 # throw value other than 0?
+    if ($exception) {
+        if ($catchframe) {                                 # does previous catch frame exist?
+            $rp = $catchframe;                             # yes: point to prev catch frame
+            ($ip, $sp, $catchframe) = @r[$rp-2..$rp];      # restore previous catch context
+            $rp -= 3;
+            $s[$sp] = $exception;                          # return throw value
+        } else {                                           # throw without catch: top level
+            die $exception;
+        }
+    }
+}
+sub xthrow          { throw $s[$sp--]; }
+my $xthrow          = primitive "throw", \&xthrow;
+
+hidden; definitions;
+sub xbrerror        { throw -1; }
+sub xstackunderflow { throw -4; }
+sub xbrnotfound     { throw -13; }
+my $xbrerror        = primitive "(error)", \&xbrerror;
+my $xstackunderflow = unnamedprimitive \&xstackunderflow;
+my $xbrnotfound     = primitive "(notfound)", \&xbrnotfound;
+my $xnotfound       = defer "notfound", $xbrnotfound;
+my $xlastword       = create "lastword"; allot 2;
+forth; definitions;
+my $xerror          = defer "error", $xbrerror;
+
+# -------- run time words: literals and flow control          --------
+
+hidden; definitions;
+sub xlit { $s[++$sp] = $m[$ip++]; }
+my $xlit = primitive "(lit)", \&xlit;
+
+sub xslit {
+    my $count = $m[$ip++];
+    $sp += 2;
+    @s[$sp-1..$sp] = ($ip, $count);
+    $ip += $count;
+}
+my $xslit = primitive '(slit)', \&xslit;
+
+sub xbrdotquote { xslit; print string; }
+my $xbrdotquote = primitive '(.")', \&xbrdotquote;
+
+
+sub xbranch { $ip += $m[$ip]; }
+my $xbranch = primitive "(branch)", \&xbranch;
+
+sub xbranch0 {
+    if ($s[$sp--]) {
+        $ip++;
+    } else {
+        $ip += $m[$ip];
+    }
+}
+my $xbranch0 = primitive "(0branch)", \&xbranch0;
+
+sub xbrfor {
+   $r[++$rp] = $s[$sp]-1;
+   $r[++$rp] = $s[$sp--]-1;
+   $ip++;
+}
+my $xbrfor = primitive "(for)", \&xbrfor;
+
+sub xbrnext {
+    if ($r[$rp]--) {
+        $ip += $m[$ip];
+    } else {
+        $rp -= 2;
+        $ip++;
+    }
+}
+my $xbrnext = primitive "(next)", \&xbrnext;
+
+sub xbrdo {
+    $rp += 2;
+    @r[$rp-1..$rp] = @s[$sp-1..$sp];
+    $sp -= 2;
+    $ip++;
+}
+
+
+my $xbrdo = primitive "(do)", \&xbrdo;
+
+sub xbrqdo {
+    if ($s[$sp] == $s[$sp-1]) {
+        $ip += $m[$ip];
+    } else {
+        $rp += 2;
+        @r[$rp-1..$rp] = @s[$sp-1..$sp];
+        $ip++ ;
+    }
+    $sp -= 2;
+}
+my $xbrqdo = primitive "(?do)", \&xbrqdo;
+
+sub xbrleave {
+    $rp -= 2;
+    $ip = $m[$ip];
+    $ip += $m[$ip];
+}
+my $xbrleave = primitive "(leave)", \&xbrleave;
+
+sub xbrqleave {
+    if ($s[$sp--]) {
+        xbrleave;
+    } else {
+        $ip++;
+    }
+}
+my $xbrqleave = primitive "(?leave)", \&xbrqleave;
+
+sub xbrloop {
+    if (++$r[$rp] != $r[$rp-1]) {                          # index+1 != limit
+        $ip += $m[$ip];                                    # add branch offset to instruction pointer
+    } else {
+        $rp -= 2;                                          # discard loop parameters
+        $ip++;                                             # skip branch offset
+    }
+}
+my $xbrloop = primitive "(loop)", \&xbrloop;
+
+sub xbrplusloop {                                          # determine loop exit condition by simulating sign overflow:
+    $w = $r[$rp] - $r[$rp-1];                              # temp = index-limit
+    $r[$rp] += $s[$sp--];                                  # index += loop increment
+    if ((($r[$rp] - $r[$rp-1]) ^ $w) < $msb) {             # sign change of index-limit before and after?
+        $ip += $m[$ip];                                    # no: add branch offset to instruction pointer
+    }  else  {
+        $rp -= 2;                                          # yes: exit loop: discard loop parameters
+        $ip++;                                             # skip branch offset
+    }
+}
+my $xbrplusloop = primitive "(+loop)", \&xbrplusloop;
+
+sub xbrunloop { $rp -= 2; }
+my $xbrunloop = primitive "(unloop)", \&xbrunloop;
+
+sub doarray {
+    if (($s[$sp] < $m[$w+1]) && ($s[$sp] >= -1))  {        # legal index. -1 addresses array size
+        $s[$sp] += ($w+2);                                 # index > address
+    } else {
+        throw -24;
+    }
+}
+
+my $xarrays = create "arrays"; comma 0;
+sub array {
+    xlink $xarrays;
+    header shift(@_);
+    reveal;
+    my $cfa = compile \&doarray;
+    my $count = shift(@_);
+    comma $count;
+    allot $count;
+    return $cfa;
+}
+
+forth; definitions;
+
+# -------- constants, variables                               -------- #FOLD00
+
+my $xesc       = constant "esc",  27;
+my $xbl        = constant "bl",   32;
+my $xfalse     = constant "false", 0;
+my $xzero      = alias    "0";
+my $xtrue      = constant "true", -1;
+my $xminusone  = alias    "-1";
+                 constant "msb", $msb;
+                 constant "maxu", $maxu;
+my $xstate     = variable "state", 0;
+my $xbase      = variable "base", 10;
+my $xhashtib   = variable "#tib", 0;
+my $xtoin      = variable ">in", 0;
+my $xinnerloop = variable "innerloop", 0;
+my $xtib       = create   "tib";  allot $tibsize;
+                 constant "version", int $version;
+                 constant "tibsize", $tibsize;
+my $xkeytable  = array    "keytable", 32;
+
+
+# -------- stack handling                                     --------
+
+
+sub xdrop    { $sp--; }
+sub xrdrop   { $rp--; }
+sub x2drop   { $sp -= 2; }
+sub xsp      { $s[++$sp]                = $sp; }
+sub xrp      { $s[++$sp]                = $rp; }
+sub xdup     { $s[++$sp]                = $s[$sp]; }
+sub xqdup    { $s[++$sp]                = $s[$sp] if ( $s[$sp]); }
+sub xover    { $s[++$sp]                = $s[$sp-1]; }
+sub xnip     { $s[$sp]                  = $s[$sp--]; }
+sub xpick    { $s[$sp]                  = $s[$sp-$s[$sp]-1]; }
+sub xdepth   { $s[++$sp]                = $sp; }
+sub xswap    { @s[$sp-1..$sp]           = ($s[$sp], $s[$sp-1]); }
+sub xrot     { @s[$sp-2, $sp-1, $sp]    = @s[$sp-1, $sp, $sp-2]; }
+sub x2dup    { $sp += 2; @s[$sp-1..$sp] = @s[$sp-3..$sp-2]; }
+sub x2over   { $sp += 2; @s[$sp-1..$sp] = @s[$sp-5..$sp-4]; }
+sub x2swap   { @s[$sp-3..$sp]           = (@s[$sp-1..$sp], @s[$sp-3..$sp-2]);}
+sub xtor     { $r[++$rp]                = $s[$sp--]; }
+sub xrfrom   { $s[++$sp]                = $r[$rp--]; }
+sub xrfetch  { $s[++$sp]                = $r[$rp]; }
+sub x2tor    { $r[++$rp]                = $s[$sp--];
+               $r[++$rp]                = $s[$sp--]; }
+sub x2rfrom  { $s[++$sp]                = $r[$rp--];
+               $s[++$sp]                = $r[$rp--]; }
+sub x2rfetch { $s[++$sp]                = $r[$rp];
+               $s[++$sp]                = $r[$rp-1]; }
+
+
+my $xdup     = primitive "dup",   \&xdup;
+my $xqdup    = primitive "?dup",  \&xqdup;
+my $xdrop    = primitive "drop",  \&xdrop;
+my $xover    = primitive "over",  \&xover;
+my $xswap    = primitive "swap",  \&xswap;
+my $xrot     = primitive "rot",   \&xrot;
+my $xnip     = primitive "nip",   \&xnip;
+my $x2dup    = primitive "2dup",  \&x2dup;
+my $x2drop   = primitive "2drop", \&x2drop;
+my $x2swap   = primitive "2swap", \&x2swap;
+my $x2over   = primitive "2over", \&x2over;
+my $xpick    = primitive "pick",  \&xpick;
+my $xdepth   = primitive "depth", \&xdepth;
+my $xtor     = primitive ">r",    \&xtor;
+my $xrfrom   = primitive "r>",    \&xrfrom;
+my $xrfetch  = primitive "r@",    \&xrfetch;
+my $xrdrop   = primitive "rdrop", \&xrdrop;
+my $x2tor    = primitive "2>r",   \&x2tor;
+my $x2rfrom  = primitive "2r>",   \&x2rfrom;
+my $x2rfetch = primitive "2r@",   \&x2rfetch;
+               primitive "rp",    \&xrp;
+               primitive "sp",    \&xsp;
+
+
+# -------- flow control                                       -------- #FOLD00
+
+
+my $xexit = primitive "exit", \&unnest;
+
+sub xi { $s[++$sp] = $r[$rp]; }
+my $xi = primitive "i", \&xi;
+
+sub xj { $s[++$sp] = $r[$rp-2]; }
+my $xj = primitive "j", \&xj;
+
+sub xuse { $m[$body[$wc-1]] = $s[$sp--]; }
+my $xuse = primitive "use", \&xuse;
+
+sub xunless { $ip = $r[$rp--] if ($s[$sp--]) }
+my $xunless = primitive "unless", \&xunless;
+
+sub xbye { print "\n"; exit; }
+my $xbye = primitive "bye", \&xbye;
+
+
+sub XIF {
+    comma $xbranch0;
+    $s[++$sp] = $dp++;
+}
+
+sub XELSE {
+    comma $xbranch;
+    my $offs = $s[$sp];
+    $s[$sp] = $dp++;
+    $m[$offs] = $dp-$offs;
+}
+
+sub XTHEN {
+    $m[$s[$sp]] = $dp-$s[$sp];
+    $sp--;
+}
+
+sub XBEGIN {
+    $s[++$sp] = $dp;
+}
+
+sub XAGAIN {
+    comma $xbranch;
+    comma $s[$sp--]-$dp;
+}
+
+sub XUNTIL {
+    comma $xbranch0;
+    comma $s[$sp--]-$dp;
+}
+
+sub XWHILE {
+    XIF;
+}
+
+sub XREPEAT {
+    xswap;
+    XAGAIN;
+    XTHEN;
+}
+
+
+# -------- bitwise logic                                      -------- #FOLD00
+
+sub xand {
+    $s[$sp-1] &= ($s[$sp--] % $wrap);
+    $s[$sp]-=$wrap if $s[$sp]>=$msb;
+}
+my $xand = primitive "and", \&xand;
+
+sub xor {
+    $s[$sp-1] |= ($s[$sp--] % $wrap);
+    $s[$sp]-=$wrap if $s[$sp]>=$msb;
+}
+my $xor = primitive "or", \&xor;
+
+sub xxor {
+    $s[$sp-1] ^= ($s[$sp--] % $wrap);
+    $s[$sp]-=$wrap if $s[$sp]>=$msb;
+}
+my $xxor = primitive "xor", \&xxor;
+
+sub xinvert {
+    $s[$sp] ^= -1;
+    $s[$sp]-=$wrap if $s[$sp]>=$msb;
+}
+my $xinvert = primitive "invert", \&xinvert;
+
+sub x2mul {
+    $s[$sp] <<= 1;
+    $s[$sp]-=$wrap if $s[$sp]>=$msb;
+}
+my $x2mul = primitive "2*", \&x2mul;
+
+sub x2div {
+    $s[$sp] >>= 1;
+}
+my $x2div = primitive "2/", \&x2div;
+
+sub xrshift {
+    $s[$sp-1] >>= ($s[$sp--] & $bits-1);
+}
+my $xrshift = primitive "rshift", \&xrshift;
+alias ">>";
+
+sub xlshift {
+    $s[$sp-1] <<= ($s[$sp--] & $bits-1);
+    $s[$sp]%=$wrap;
+    $s[$sp]-=$wrap if $s[$sp]>=$msb;
+}
+my $xlshift = primitive "lshift", \&xlshift;
+alias "<<";
+
+
+
+# -------- comparison                                         --------
+
+
+sub xequals { $s[--$sp] = -($s[$sp] == $s[$sp-1]); }
+my $xequals = primitive "=", \&xequals;
+
+sub xnotequals { $s[--$sp] = -($s[$sp] != $s[$sp-1]); }
+my $xnotequals = primitive "<>", \&xnotequals;
+
+sub xless { my $tos = $s[$sp--]; $s[$sp] = -($s[$sp] < $tos); }
+my $xless = primitive "<", \&xless;
+
+sub xuless { my $tos = $s[$sp--]|0; $s[$sp] = -(($s[$sp]|0) < $tos); }
+my $xuless = primitive "u<", \&xuless;
+
+sub xgreater { my $tos = $s[$sp--]; $s[$sp] = -($s[$sp] > $tos); }
+my $xgreater = primitive ">", \&xgreater;
+
+sub xugreater { my $tos = $s[$sp--]|0; $s[$sp] = -(($s[$sp]|0) > $tos); }
+my $xugreater = primitive "u>", \&xugreater;
+
+sub xzeroequals { $s[$sp] = -(!$s[$sp]); }
+my $xzeroequals = primitive "0=", \&xzeroequals;
+
+sub xzeronotequals { $s[$sp] = -(!!$s[$sp]); }
+my $xzeronotequals = primitive "0<>", \&xzeronotequals;
+
+sub xzeroless { $s[$sp] = -($s[$sp] < 0); }
+my $xzeroless = primitive "0<", \&xzeroless;
+
+sub xzeromore { $s[$sp] = -($s[$sp] > 0); }
+my $xzeromore = primitive "0>", \&xzeromore;
+
+
+# -------- arithmetic                                         --------
+
+
+sub xoneplus {
+    $s[$sp]++;
+    $s[$sp] -= $wrap if $s[$sp] >= $msb;
+}
+my $xoneplus = primitive "1+", \&xoneplus;
+
+sub xoneminus {
+    $s[$sp]--;
+    $s[$sp] += $wrap if $s[$sp] < -$msb;
+}
+my $xoneminus = primitive "1-", \&xoneminus;
+
+
+sub xplus {
+    $s[$sp-1] += $s[$sp--];
+    $s[$sp]%=$wrap;
+    $s[$sp]-=$wrap if $s[$sp] >= $msb;
+}
+my $xplus = primitive "+", \&xplus;
+
+sub xminus {
+    $s[$sp-1] -= $s[$sp--];
+    $s[$sp]%=$wrap;
+    $s[$sp]-=$wrap if $s[$sp] >= $msb;
+}
+my $xminus = primitive "-", \&xminus;
+
+sub xmul {
+    $s[$sp-1] *= $s[$sp--];
+    $s[$sp]%=$wrap;
+    $s[$sp]-=$wrap if $s[$sp] >= $msb;
+}
+my $xmul = primitive "*", \&xmul;
+
+sub xdiv {
+    if (!$s[$sp]) { throw -10; }
+    $s[$sp-1] /= $s[$sp--];
+}
+my $xdiv = primitive "/", \&xdiv;
+
+sub xmod {
+    if (!$s[$sp]) { throw -10; }
+    $s[$sp-1] %= $s[$sp--];
+}
+my $xmod = primitive "mod", \&xmod;
+
+sub xstarslash {
+    if (!$s[$sp]) { throw -10; }
+    $s[$sp-2] *= $s[$sp-1];
+    $s[$sp-2] /= $s[$sp];
+    $sp -= 2;
+    $s[$sp]%=$wrap;
+    $s[$sp]-=$wrap if $s[$sp] >= $msb;
+}
+my $xstarslash = primitive "*/", \&xstarslash;
+
+# ( n1 n2 -- n3 n4 )
+sub xslashmod {
+    @s[$sp-1..$sp] = ($s[$sp-1]%$s[$sp], int $s[$sp-1]/$s[$sp]);
+}
+my $xslashmod = primitive "/mod", \&xslashmod;
+
+
+# ( n1 n2 -- n3 n4 )
+sub xuslashmod {
+    $s[$sp-1]%=$wrap;
+    @s[$sp-1..$sp] = ($s[$sp-1]%$s[$sp], int $s[$sp-1]/$s[$sp]);
+}
+my $xuslashmod = primitive "u/mod", \&xuslashmod;
+
+
+sub xstarslashmod {
+    if (!$s[$sp]) { throw -10; }
+    $s[$sp-2] *= $s[$sp-1];
+    @s[$sp-2..$sp-1] = ($s[$sp-2]%$s[$sp], int $s[$sp-2]/$s[$sp]);
+    $s[$sp]%=$wrap;
+    $s[$sp]-=$wrap if $s[$sp] >= $msb;
+    $sp--;
+}
+my $xstarslashmod = primitive "*/mod", \&xstarslashmod;
+
+sub xabs { $s[$sp] = abs($s[$sp]); }
+my $xabs = primitive "abs", \&xabs;
+
+sub xnegate { $s[$sp] = -$s[$sp]; }
+my $xnegate = primitive "negate", \&xnegate;
+
+
+# -------- memory access                                      -------- #FOLD00
+
+
+sub xfetch { $s[$sp] = $m[$s[$sp]&$cell]; }
+my $xfetch = primitive "@", \&xfetch;
+
+sub xcfetch { $s[$sp] = $m[$s[$sp]&$cell] & 255; }
+my $xcfetch = primitive "c@", \&xcfetch;
+
+# ( a -- d )
+sub x2fetch {
+    my $addr = $s[$sp++]&$cell;
+    @s[$sp-1..$sp] = @m[$addr..$addr+1];
+}
+my $x2fetch = primitive "2@", \&x2fetch;
+
+sub xstore {
+    $m[$s[$sp]&$cell] = $s[$sp-1];
+    $sp-=2;
+}
+my $xstore = primitive "!", \&xstore;
+
+sub xcstore {
+    $m[$s[$sp]&$cell] = $s[$sp-1] & 255;
+    $sp-=2;
+}
+my $xcstore = primitive "c!", \&xcstore;
+
+# ( d a -- )
+sub x2store {
+    my $addr = $s[$sp--]&$cell;
+    @m[$addr..$addr+1] = @s[$sp-1..$sp];
+    $sp -= 2
+}
+my $x2store = primitive "2!", \&x2store;
+
+sub xplusstore {
+    $m[$s[$sp]&$cell] += $s[$sp-1];
+    $sp-=2;
+}
+my $xplusstore = primitive "+!", \&xplusstore;
+
+sub xcount { $s[++$sp] = $m[$s[$sp]++&$cell] & 255; }
+my $xcount = primitive "count", \&xcount;
+
+sub xskim { $s[++$sp] = $m[$s[$sp]++&$cell]; }
+my $xskim = primitive "skim", \&xskim;
+
+sub xon { $m[$s[$sp--]&$cell] = -1; }
+my $xon = primitive "on", \&xon;
+
+sub xoff { $m[$s[$sp--]&$cell] = 0; }
+my $xoff = primitive "off", \&xoff;
+
+# ( x1 a -- x2 )
+sub xexchange {
+    my $addr = $s[$sp--]&$cell;
+    ($m[$addr], $s[$sp]) = ($s[$sp], $m[$addr]);
+}
+my $xexchange = primitive "exchange", \&xexchange;
+
+# ( a1 n1 c -- a2 n2 )
+sub xskip {
+    my $char = $s[$sp--];
+    (my $addr, my $len) = @s[$sp-1..$sp];
+    while (($m[$addr&$cell] == $char) && ($len)) {
+        $addr++;
+        $len--;
+    }
+    @s[$sp-1..$sp] = ($addr, $len);
+}
+my $xskip = primitive "skip", \&xskip;
+
+# ( a1 n1 c -- a2 n2 )
+sub xscan {
+    my $char = $s[$sp--];
+    (my $addr, my $len) = @s[$sp-1..$sp];
+    while (($m[$addr&$cell] != $char) && ($len)) {
+        $addr++;
+        $len--;
+    }
+    @s[$sp-1..$sp] = ($addr, $len);
+}
+my $xscan = primitive "scan", \&xscan;
+
+# ( src dst n -- )
+sub xmove {
+    (my $src, my $dest, my $count) = @s[$sp-2..$sp];
+    @m[$dest..$dest+$count-1] = @m[$src..$src+$count-1];
+    $sp-=3;
+}
+my $xmove = primitive "move", \&xmove;
+
+# ( a n c -- )
+sub xfill {
+    (my $dest, my $count, my $char) = @s[$sp-2..$sp];
+    @m[$dest..$dest+$count-1] = ($char) x $count;
+    $sp-=3;
+}
+my $xfill = primitive "fill", \&xfill;
+
+
+
+# -------- number conversion                                  -------- #FOLD00
+
+
+my %radixprefix = (
+   '%' =>  2,
+   '&' =>  8,
+   '#' => 10,
+   '$' => 16,
+   '_' => 36,
+);
+
+# ( a n -- x -1 | 0 )
+sub xqnumber  {
+    my $sign = 0;
+    my $accu = 0;                                          # accumulator
+    my $valid = -1;                                        # assume valid number
+
+    my $i = $s[$sp--];                                     # number of digits to test/convert
+    $w = $s[$sp--];                                        # addr of next digit
+
+    if ($m[$w] == 45) {                                    # leading -
+        $sign--;
+        $w++;                                              # strip
+        $i--;
+    }
+
+    my $radix = $m[$xbase+1];                              # assume radix from base
+    if (defined $radixprefix{chr $m[$w]}) {                # but if radix prefix,
+        $radix = $radixprefix{chr $m[$w]};                 #    use radix for prefix
+        $w++;                                              #    strip prefix
+        $i--;
+    }
+
+    for (; $i; $i--) {                                     # for all digits
+        my $digit = $m[$w++] - 48;                         # read digit
+        if (($digit < 0) || (($digit > 9) && ($digit < 17))) {
+            $valid = 0;
+            last;
+        }
+        $digit -=  7 if ($digit > 9 );                     # remove gap between 9 and A
+        $digit -= 32 if ($digit > 41);                     # a..z -> A..Z
+        if (($digit < 0) || ($digit >= $radix)) {
+            $valid = 0;
+            last;
+        }
+        ($accu *= $radix) += $digit;
+    }
+
+    if ($valid) {
+        $accu = -$accu if ($sign);
+        $accu %= $wrap;
+        $accu -= $wrap if $accu >= $msb;
+        $s[++$sp] = $accu;
+    }
+    $s[++$sp] = $valid;
+}
+my $xqnumber = primitive "?number", \&xqnumber;
+
+# -------- output                                             -------- #FOLD00
+
+
+sub xcr { print "\n"; }
+my $xcr = primitive "cr", \&xcr;
+
+sub xemit { printf "%c",$s[$sp--]; }
+my $xemit = primitive "emit", \&xemit;
+
+sub xdotslit { print $m[$ip++]; }
+my $xdotslit = unnamedprimitive \&xdotslit;
+
+sub xspace { print " "; }
+my $xspace = primitive "space", \&xspace;
+
+# ( a n -- )
+sub xtype { print string; }
+my $xtype = primitive "type", \&xtype;
+
+
+# -------- character input                                    -------- #FOLD00
+
+
+
+my $keybuffer;
+# ( -- c )   lowest level key input word
+sub xbrkey {
+    my $key = $keybuffer;
+    $keybuffer = 0;
+    if (!$key) {
+        ReadMode 4;
+        $key = ReadKey(0);
+        ReadMode 0;
+    }
+    $s[++$sp] = ord $key;
+}
+my $xbrkey = primitive "(key)", \&xbrkey;
+my $xkey = defer "key", $xbrkey;
+
+
+sub xqkey {
+    if ($keybuffer) {
+        $s[++$sp] = -1;
+    } else {
+        ReadMode 4;
+        $keybuffer = ReadKey(-1);          # possible race condition resulting in occasional echoing
+        ReadMode 0;
+        $s[++$sp] = -(defined $keybuffer);
+    }
+}
+my $xqkey = primitive "key?", \&xqkey;
+
+
+# -------- buffered I/O                                       -------- #FOLD00
+
+
+# read string, delimited by c. return address and len
+# updates source
+# ( c -- a n )
+sub xparse {
+    my $delimiter = $s[$sp];
+    my $bufend = $parsebuf + $parsebuflen;                 # first non-buf address
+    $w = $m[$xtoin+1] + $parsebuf;                         # parse address
+    my $nxtchar = $m[$w];
+    if ($delimiter == 32) {
+        for (; $w < $bufend;) {
+            last if (!(defined $nxtchar));
+            last if ($nxtchar != $delimiter);
+            $w++;
+            $nxtchar = $m[$w];
+        }
+    }
+    $s[$sp] = $w;
+    for (; $w < $bufend;) {
+        last if (!(defined $nxtchar) || ($nxtchar == $delimiter));
+        $nxtchar = $m[++$w];
+    }
+    $s[++$sp] = $w - $s[$sp];
+    $w++ if ((defined $nxtchar) && ($nxtchar == $delimiter));
+    $m[$xtoin+1] = $w - $parsebuf;
+}
+my $xparse = primitive "parse", \&xparse;
+
+sub xsource {
+    $sp += 2;
+    @s[$sp-1..$sp] = ($parsebuf, $parsebuflen);
+}
+my $xsource = primitive "source", \&xsource;
+
+hidden; definitions;
+# ( addr len offs -- )
+sub xpushsource {
+    push @sourcestack, $m[$xtoin+1], $parsebuf, $parsebuflen;
+    $m[$xtoin+1] = 0;
+    ($parsebuf, $parsebuflen) = @s[$sp-1..$sp];
+    $sp -= 2;
+}
+my $xpushsource = primitive "pushsource", \&xpushsource;
+
+sub xpopsource {
+    $parsebuflen   = pop @sourcestack;
+    $parsebuf      = pop @sourcestack;
+    $m[$xtoin+1]   = pop @sourcestack;
+}
+my $xpopsource = primitive "popsource", \&xpopsource;
+
+
+# ( a n1 asc -- a n2 )
+my $xdecode = colon "decode";
+    compile $xdup, $xlit, 127, $xequals;                   # Del/BS: remove previous
+    compile $xover, $xlit, 8, $xequals, $xor;
+    XIF;  compile $xdrop;
+          compile $xdup;
+          XIF;  compile $xdotslit, "\b \b", $xoneminus;  XTHEN;
+          compile $xexit;
+    XTHEN;
+    compile $xdup, $xlit, 9, $xequals;                     # Tab: convert to space
+    XIF;  compile $xdrop, $xbl;  XTHEN;
+    compile $xdup, $xemit;                                 # echo char
+    compile $xtor, $x2dup, $xplus;                         # calc buffer address
+    compile $xrfrom, $xswap, $xstore;                      # buffer char
+    compile $xoneplus;                                     # count
+semicolon;
+forth; definitions;
+
+
+# -------- dictionary and compilation                         -------- #FOLD00
+
+
+sub xhere { $s[++$sp] = $dp; }
+my $xhere = primitive "here", \&xhere;
+
+sub xallot { $dp += $s[$sp--]; }
+my $xallot = primitive "allot", \&xallot;
+
+sub xcomma { $m[$dp++&$cell] = $s[$sp--]; }
+my $xcomma = primitive ",", \&xcomma;
+
+my $xstateoff = colon '['; immediate;
+    compile $xstate, $xoff;
+semicolon;
+
+my $xstateon = colon "]";
+    compile $xstate, $xon;
+semicolon;
+
+my $xcompiling = colon "compiling";
+    compile $xstate, $xfetch;
+semicolon;
+
+my $xqcomp = colon "?comp";
+   compile $xcompiling, $xzeroequals;
+   compile $xlit, -14, $xand, $xthrow;
+semicolon;
+
+my $xqexec = colon "?exec";
+   compile $xcompiling;
+   compile $xlit, -64, $xand, $xthrow;
+semicolon;
+
+
+# -------- vocabulary/wordlist                                -------- #FOLD00
+
+
+sub xheader { header string }
+my $xheader    = primitive "header",    \&xheader;
+my $xhide      = primitive "hide",      \&hide;
+my $xreveal    = primitive "reveal"   , \&reveal;
+my $ximmediate = primitive "immediate", \&immediate;
+
+# ( header -- f )
+sub xqimm {
+        $s[$sp] = -(!!($precedence[$s[$sp]] & $precedencebit));
+}
+my $xqimm = primitive "?imm", \&xqimm;
+
+sub xwords {
+    my $nfa = $m[$m[$xcontextstore]+2];
+    while ($nfa) {
+        print "$header[$nfa] ";
+        $nfa = $voclink[$nfa];
+    }
+    xcr;
+}
+only; definitions;
+my $xwords = primitive "words", \&xwords;
+forth; definitions;
+
+sub xnamefrom { $s[$sp] = $body[$s[$sp]]; }
+my $xnamefrom = primitive "name>", \&xnamefrom;
+
+
+hidden; definitions;
+# returns matching header index, aka nfa, (or 0)
+# ( a1 n -- a2 | 0 )
+sub xbrhunt {
+    my $name = string;
+    $s[++$sp] = 0;
+    my $last = $m[$m[$xcontextstore]+2];
+    while ($last) {
+        if ($precedence[$last] & $revealbit) {
+            if ($header[$last] eq $name) {
+                $s[$sp] = $last;
+                last;
+            }
+        }
+        $last = $voclink[$last]
+    }
+}
+my $xbrhunt = primitive "(hunt)", \&xbrhunt;
+forth; definitions;
+
+sub xhunt {
+    x2dup; xbrhunt;
+    if (!($s[$sp])) {
+        my $prevcontext = $m[$xcontextstore];
+        my $vocstackdepth = $#vocstack;
+        for my $voc (0..$vocstackdepth) {
+            my $tempcontext = $vocstack[$vocstackdepth-$voc];
+            if ($tempcontext != $prevcontext) {
+                xdrop;
+                $m[$xcontextstore] = $tempcontext;
+                x2dup; xbrhunt;
+                last if ($s[$sp]);
+            }
+        }
+        $m[$xcontextstore] = $prevcontext;
+    }
+    xnip; xnip;
+}
+my $xhunt = primitive "hunt", \&xhunt;
+
+
+
+
+# returns matching header index, aka nfa, (or 0)
+# ( cfa -- a | 0 )
+sub xtoname {
+    my $cfa = $s[$sp];
+    $s[$sp] = 0;
+    for (my $i=$wc-1; $i; --$i) {
+        if ($body[$i] eq $cfa) {
+            $s[$sp] = $i;
+            last;
+        }
+    }
+}
+my $xtoname = primitive ">name", \&xtoname;
+
+
+# ( cfa -- a n )
+sub xname {
+    xtoname;
+    my $nfa = $s[$sp];
+    $s[$sp] = $dp;
+    $s[++$sp] = 0;
+    if ($nfa) {
+        $s[$sp] = $dp;
+        unstring $header[$nfa];
+    }
+}
+my $xname = primitive "name", \&xname;
+
+
+# ( cfa -- )
+sub xdotname {
+    xtoname;
+    print $header[$s[$sp]] if ($s[$sp]);
+    $sp--; }
+my $xdotname = primitive ".name", \&xdotname;
+
+sub xorder {
+    print "\ncontext: ";
+    $s[++$sp] = $m[$xcontextstore];
+    xdotname; xspace; xspace;
+    my $vocstackdepth = $#vocstack;
+    for my $voc (0..$vocstackdepth) {
+        $s[++$sp] = $vocstack[$vocstackdepth-$voc];
+        xdotname; xspace;
+    }
+    $s[++$sp] = $m[$xcurrentstore];
+    print "\ncurrent: ";
+    xdotname; xspace; xcr;
+}
+only; definitions;
+my $xorder = primitive "order", \&xorder;
+forth; definitions;
+
+my $xtick = colon "'";
+    compile $xbl, $xparse;
+    compile $x2dup, $xlastword, $x2store;
+    compile $xhunt;
+    compile $xqdup;
+    XIF;   compile $xnamefrom;
+    XELSE; compile $xnotfound;
+    XTHEN;
+semicolon;
+
+
+my $xcreate = colon "create";
+    compile $xbl, $xparse;
+    compile $xqdup, $xzeroequals, $xlit, -16, $xand, $xthrow;
+    compile $xheader, $xlit, \&dovar, $xcomma;
+    compile $xreveal;
+semicolon;
+
+
+my $xcolon = colon ":"; immediate;
+    compile $xcompiling, $xlit, -29, $xand, $xthrow;
+    compile $xcreate, $xhide;
+    compile $xlit, \&nest, $xuse;
+    compile $xstateon;
+semicolon;
+
+
+my $xsemicolon = colon ";"; immediate;
+    compile $xqcomp, $xlit, $xexit, $xcomma,
+            $xstateoff, $xreveal;
+semicolon;
+
+
+# -------- misc                                               -------- #FOLD00
+
+
+sub xepoch { $s[++$sp] = time; }
+my $xepoch = primitive "epoch", \&xepoch;
+
+
+my $xstructured = colon "structured";
+    compile $x2dup, $xnotequals;
+    compile $xlit, -22, $xand, $xthrow;
+    compile $x2drop;
+semicolon;
+
+sub xdefined { $s[$sp] = -(defined $s[$sp]); }
+my $xdefined = primitive "defined", \&xdefined;
+
+# ( a n -- x )
+sub xshell {
+    print "\n";
+    system string;
+}
+primitive "shell", \&xshell;
+
+
+# -------- does>                                              -------- #FOLD00
+
+sub xdodoes {                                              # cfa of created word revectored here.
+    $s[++$sp] = $w+1;                                      # push data address of created word
+    $r[++$rp] = $ip;                                       # nest to hilevel code behind does>
+    $ip = $does{$w};
+}
+
+sub xdoes {
+    $m[$body[$wc-1]] = \&xdodoes;                          # revector created word to point to dodoes
+    $does{$body[$wc-1]} = $ip;                             # does> code pointer hashed to key "body address"
+    $ip = $r[$rp--];                                       # unnest, preventing execution of does> code now
+}
+primitive "does>", \&xdoes;
+
+
+# -------- interpreter/compiler                               -------- #FOLD00
+
+# ( a n -- x -1 | d -1 | r -1 | -1 | 0 )
+sub xinterpretnumber {
+    xqnumber;
+    if ($s[$sp] && $m[$xstate+1]) {                        # number valid while compiling?
+        $dp += 2;
+        @m[$dp-2..$dp-1] = ($xlit, $s[--$sp]);             # yes: compile number as literal
+        $s[$sp] = -1;                                      #      and remove from stack.
+    }
+}
+my $xinterpretnumber = unnamedprimitive \&xinterpretnumber;
+
+
+hidden; definitions;
+# ( -- )
+my $xbrinterpret = colon "(interpret)";
+    XBEGIN; compile $xbl, $xparse;                        # pull in string from buffered input
+            compile $xdup;
+    XWHILE; compile $x2dup, $xlastword, $x2store;         # keep copy for literal or error
+            compile $xhunt, $xqdup;                       # got string, look up in dictionary
+        XIF;                                              # found in dictionary:
+            compile $xdup, $xqimm;                        # immediate word?
+            XIF; compile $xnamefrom, $xexecute;           # execute immediate words always
+            XELSE;  compile $xnamefrom, $xcompiling;      # non-immediate words depend on compile state:
+                XIF;   compile $xcomma;                   # postponed execution when compiling
+                XELSE; compile $xexecute;                 # immediate execution when interpreting
+                XTHEN;
+            XTHEN;
+            compile $xdepth, $xzeroless;                  # test for stack underflow
+            XIF;  compile $xstackunderflow;  XTHEN;       # throw exception in case of
+        XELSE; compile $xlastword, $x2fetch;
+            compile $xinterpretnumber, $xzeroequals;      # word not found: try as number
+            XIF;
+                compile $xlastword, $x2fetch, $xnotfound; # neither, try user hook
+            XTHEN;
+        XTHEN;
+    XREPEAT;  compile $x2drop;
+semicolon;
+forth; definitions;
+my $xinterpret  = defer "interpret", $xbrinterpret;
+
+
+# ( a n -- )
+my $xevaluate = colon "evaluate";
+   compile $xpushsource;
+   compile $xinterpret;
+   compile $xpopsource;
+semicolon;
+
+
+# -------- disk I/O                                           --------
+
+my $line;
+sub publish {
+    if (defined $line) {
+        $s[++$sp] = $dp;
+        $s[++$sp] = $dp;
+        chomp($line);
+        unstring $line;
+    }
+    $s[++$sp] = -(defined $line);
+}
+
+# ( a -- u )
+sub xread {
+    ($line, @disk) = @disk;
+    publish;
+}
+my $xread   = unnamedprimitive \&xread;
+
+
+
+# ( a n -- )
+sub fileopen {
+    open(file1, "< ".string)
+    or throw(-38);
+}
+my $xfileopen = primitive "fileopen", \&fileopen;
+
+sub fileclose {
+    close(file1);
+}
+my $xfileclose = primitive "fileclose", \&fileclose;
+
+# ( -- a n -1 | 0 )
+sub fileread {
+    $line = <file1>;
+    publish;
+}
+my $xfileread = primitive "fileread", \&fileread;
+
+
+# -------- entry point, init, and VM main loop                -------- #FOLD00
+
+
+my $xprompt = defer "prompt", $xnop;
+my $xquit   = defer "quit", $xbye;
+
+sub xempty {
+    $rp = -1;                                              # init return stack
+    $sp = -1;                                              # init data stack
+    $catchframe = 0;
+    @sourcestack = ();                                     # drop any nested input source
+}
+my $xempty = primitive "empty", \&xempty;
+
+my $xabort  = colon "abort";
+    compile $xquit;
+semicolon;
+
+
+my $xcold   = compile $xonly, $xempty;
+    XBEGIN;   compile $xread;
+    XWHILE;   compile $xevaluate;
+    XREPEAT;
+my $xwarm   = compile $xabort;
+
+sub exceptionhandler {
+    my $exception   = $@;
+    my $exceptionnr = $@;
+    $exceptionnr    =~ s/ .*\n//;
+    my $err0 = pack "C*", @m[$parsebuf..$parsebuf+$m[$xtoin+1]-1];  # collect source line from virtual memory
+    print "\n", $err0;                                     # print the line containing the error
+    $err0 =~ s/ *$//;                                      # strip trailing spaces
+    my $all = length($err0);                               # determine length of whole line
+    $err0 =~ s/[^ ]*$//;                                   # strip last space delimited string
+    my $ok = length($err0);                                # determine length of part without error
+    print "\n", " " x $ok, "^" x ($all-$ok);               # underscore error with carets
+    print "\n", $throwmessage{$exceptionnr} if (defined $throwmessage{$exceptionnr});
+    print "\nexception ", $exception;
+}
+
+
+
+
+use Term::ANSIColor;
+my @color; my @bgcolor;
+my $color             = 0;
+
+my $xblack            = constant "black", $color;
+$color[$color]        = color 'black';
+$bgcolor[$color++]    = color 'on_black'; 
+
+my $xgreen            = constant "green", $color;
+$color[$color]        = color 'green';
+$bgcolor[$color++]    = color 'on_green'; 
+
+my $xred              = constant "red", $color;
+$color[$color]        = color 'red';
+$bgcolor[$color++]    = color 'on_red'; 
+
+my $xblue             = constant "blue", $color;
+$color[$color]        = color 'blue';
+$bgcolor[$color++]    = color 'on_blue'; 
+
+my $xyellow           = constant "yellow", $color;
+$color[$color]        = color 'yellow';
+$bgcolor[$color++]    = color 'on_yellow'; 
+
+my $xcyan             = constant "cyan", $color;
+$color[$color]        = color 'cyan';
+$bgcolor[$color++]    = color 'on_cyan'; 
+
+my $xmagenta          = constant "magenta", $color;
+$color[$color]        = color 'magenta';
+$bgcolor[$color++]    = color 'on_magenta'; 
+
+my $xwhite            = constant "white", $color;
+$color[$color]        = color 'white';
+$bgcolor[$color++]    = color 'on_white'; 
+
+#my $xbold             = constant "bold", $color;
+#$color[$color]        = color 'bold';
+#$bgcolor[$color++]    = color 'bold'; 
+
+#my $xblink            = constant "blink", $color;
+#$color[$color]        = color 'blink';
+#$bgcolor[$color++]    = color 'blink'; 
+
+#my $xunderscore       = constant "underscore", $color;
+#$color[$color]        = color 'underscore';
+#$bgcolor[$color++]    = color 'underscore'; 
+
+#my $xreset            = constant "reset", $color;
+#$color[$color]        = color 'reset';
+#$bgcolor[$color++]    = color 'reset'; 
+
+
+
+my $fg = 7;
+my $bg = 0;
+
+sub xfg {
+   $fg = $s[$sp--];
+   print $color[$fg];
+}
+primitive "fg", \&xfg;
+
+sub xbg {
+   $bg = $s[$sp--];
+   print $bgcolor[$bg];
+}
+primitive "bg", \&xbg;
+
+sub xfetchcolors {
+   $s[++$sp] = $fg;
+   $s[++$sp] = $bg;
+}
+primitive '@colors', \&xfetchcolors;
+
+sub xcolors {
+   xbg;
+   xfg;
+}
+primitive "colors", \&xcolors;
+
+
+
+
+
+sub main {
+    $ip = $xcold;                                          # set instruction pointer to coldstart
+    until (0) {
+        eval {
+            until (0) {                                    # virtual machine execution loop:
+                $w = $m[$ip++];                            # instruction fetch
+#                 $s[++$sp] = $w; xdotname; xspace;
+#                 xcr if $w == $xexit;
+                $m[$w]();                                  # instruction execute
+            }
+        };                                                 # interpreter error exit
+        exceptionhandler;
+        $ip = $xwarm;                                      # reenter at warmstart
+    }
+}
+main;
