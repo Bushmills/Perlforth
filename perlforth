@@ -7,10 +7,11 @@
 
 =cut
 
-my $version = 27;
+my $version = 28;
 # to do: improved file interface. can only read source files to compile from now.
 # time of last change:
 
+# 20190905,ls 0.28 fixed /, stripping the hidden fractional part
 # 20110512,ls    colors
 # 20110428,ls 0.27 arithmetic on addresses may result in negative mem array indici. changed some memory primitives to unsign addresses 
 # 20110427,ls problem with 64 bit. forcing to 32 bit for now.
