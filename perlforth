@@ -7,13 +7,12 @@
 
 =cut
 
-my $version = 28;
-# to do: improved file interface. can only read source files to compile from now.
-# time of last change:
-
+my $version = 29;
+# to do: improve file interface. can only read source files to compile from now.
+# 20190905,ls 0.29 partial unrolling main interpreter loop
 # 20190905,ls 0.28 fixed /, stripping the hidden fractional part
-# 20110512,ls    colors
-# 20110428,ls 0.27 arithmetic on addresses may result in negative mem array indici. changed some memory primitives to unsign addresses 
+# 20110512,ls      colors
+# 20110428,ls 0.27 arithmetic on addresses may result in negative mem array indici. changed some memory primitives to unsign addresses
 # 20110427,ls problem with 64 bit. forcing to 32 bit for now.
 # 20110420,ls 0.26 string packing and unpacking using W type strings.
 # 20091001,ls 0.25 initialising catchframe in empty avoids undefined error handler when quitting in site-forth.4th
@@ -1867,51 +1866,51 @@ my $color             = 0;
 
 my $xblack            = constant "black", $color;
 $color[$color]        = color 'black';
-$bgcolor[$color++]    = color 'on_black'; 
+$bgcolor[$color++]    = color 'on_black';
 
 my $xgreen            = constant "green", $color;
 $color[$color]        = color 'green';
-$bgcolor[$color++]    = color 'on_green'; 
+$bgcolor[$color++]    = color 'on_green';
 
 my $xred              = constant "red", $color;
 $color[$color]        = color 'red';
-$bgcolor[$color++]    = color 'on_red'; 
+$bgcolor[$color++]    = color 'on_red';
 
 my $xblue             = constant "blue", $color;
 $color[$color]        = color 'blue';
-$bgcolor[$color++]    = color 'on_blue'; 
+$bgcolor[$color++]    = color 'on_blue';
 
 my $xyellow           = constant "yellow", $color;
 $color[$color]        = color 'yellow';
-$bgcolor[$color++]    = color 'on_yellow'; 
+$bgcolor[$color++]    = color 'on_yellow';
 
 my $xcyan             = constant "cyan", $color;
 $color[$color]        = color 'cyan';
-$bgcolor[$color++]    = color 'on_cyan'; 
+$bgcolor[$color++]    = color 'on_cyan';
 
 my $xmagenta          = constant "magenta", $color;
 $color[$color]        = color 'magenta';
-$bgcolor[$color++]    = color 'on_magenta'; 
+$bgcolor[$color++]    = color 'on_magenta';
 
 my $xwhite            = constant "white", $color;
 $color[$color]        = color 'white';
-$bgcolor[$color++]    = color 'on_white'; 
+$bgcolor[$color++]    = color 'on_white';
 
 #my $xbold             = constant "bold", $color;
 #$color[$color]        = color 'bold';
-#$bgcolor[$color++]    = color 'bold'; 
+#$bgcolor[$color++]    = color 'bold';
 
 #my $xblink            = constant "blink", $color;
 #$color[$color]        = color 'blink';
-#$bgcolor[$color++]    = color 'blink'; 
+#$bgcolor[$color++]    = color 'blink';
 
 #my $xunderscore       = constant "underscore", $color;
 #$color[$color]        = color 'underscore';
-#$bgcolor[$color++]    = color 'underscore'; 
+#$bgcolor[$color++]    = color 'underscore';
 
 #my $xreset            = constant "reset", $color;
 #$color[$color]        = color 'reset';
-#$bgcolor[$color++]    = color 'reset'; 
+#$bgcolor[$color++]    = color 'reset';
 
 
 
@@ -1951,10 +1950,14 @@ sub main {
     until (0) {
         eval {
             until (0) {                                    # virtual machine execution loop:
-                $w = $m[$ip++];                            # instruction fetch
-#                 $s[++$sp] = $w; xdotname; xspace;
-#                 xcr if $w == $xexit;
-                $m[$w]();                                  # instruction execute
+                $w = $m[$ip++]; $m[$w]();                  # instruction fetch and execute
+                $w = $m[$ip++]; $m[$w]();                  # instruction fetch and execute
+                $w = $m[$ip++]; $m[$w]();                  # instruction fetch and execute
+                $w = $m[$ip++]; $m[$w]();                  # instruction fetch and execute
+                $w = $m[$ip++]; $m[$w]();                  # instruction fetch and execute
+                $w = $m[$ip++]; $m[$w]();                  # instruction fetch and execute
+                $w = $m[$ip++]; $m[$w]();                  # instruction fetch and execute
+                $w = $m[$ip++]; $m[$w]();                  # instruction fetch and execute
             }
         };                                                 # interpreter error exit
         exceptionhandler;
