@@ -1149,7 +1149,8 @@ my $xmul = primitive "*", \&xmul;
 
 sub xdiv {
     if (!$s[$sp]) { throw -10; }
-    $s[$sp-1] /= $s[$sp--];
+    $w = $s[$sp--];
+    $s[$sp] = int($s[$sp] / $w);
 }
 my $xdiv = primitive "/", \&xdiv;
 
